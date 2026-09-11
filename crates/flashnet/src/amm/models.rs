@@ -518,27 +518,33 @@ impl Pool {
             amount_out_with_slippage
         };
 
+        // A pool can't pay out more of an asset than it holds, whatever its
+        // curve. Reject before quoting so a V3 pool with no liquidity (which
+        // the price-based branch below would otherwise quote from its
+        // self-reported tick alone) never looks viable. Reserves are
+        // optional in the API response; a pool that doesn't report them is
+        // left to the curve-specific logic as before.
+        let reserves = match (self.asset_a_reserve, self.asset_b_reserve) {
+            (Some(reserve_a), Some(reserve_b)) if is_a_to_b => Some((reserve_a, reserve_b)),
+            (Some(reserve_a), Some(reserve_b)) => Some((reserve_b, reserve_a)),
+            _ => None,
+        };
+        if let Some((_, reserve_out)) = reserves
+            && amount_out_before_output_fees >= reserve_out
+        {
+            return Err(FlashnetError::Generic(
+                "Amount out exceeds reserve out".to_string(),
+            ));
+        }
+
         // Calculate amount_in before input fees
         // V3 concentrated pools use concentrated liquidity, not constant product,
         // so we skip reserve-based calculation and use price-based instead
         let amount_in_before_input_fees = if !is_v3
-            && let (Some(reserve_a), Some(reserve_b)) = (self.asset_a_reserve, self.asset_b_reserve)
+            && let Some((reserve_in, reserve_out)) = reserves
         {
             // Calculate amount_in using reserves with integer arithmetic
             // amount_in = (reserve_in × amount_out) / (reserve_out - amount_out)
-            let (reserve_in, reserve_out) = if is_a_to_b {
-                (reserve_a, reserve_b)
-            } else {
-                (reserve_b, reserve_a)
-            };
-
-            // Check for overflow/underflow conditions
-            if amount_out_before_output_fees >= reserve_out {
-                return Err(FlashnetError::Generic(
-                    "Amount out exceeds reserve out".to_string(),
-                ));
-            }
-
             let numerator = reserve_in
                 .checked_mul(amount_out_before_output_fees)
                 .ok_or(overflow_err.clone())?;
