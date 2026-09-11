@@ -55,6 +55,17 @@ pub fn select_best_pool(
         ));
     }
 
+    // Drop pools whose self-reported price is nowhere near the market. Pool
+    // creation is permissionless, and a V3 pool is quoted from its price
+    // alone — so a pool with (almost) nothing in it and an absurd tick quotes
+    // a near-zero amount_in, wins the fee-efficiency score outright, and the
+    // swap then fails at the AMM. The market price is taken from the deepest
+    // viable pool (by TVL, else asset-B reserve); pools more than
+    // PRICE_SANITY_FACTOR away from it in either direction are excluded.
+    // Real pools for one pair sit within arbitrage distance of each other,
+    // far inside that band.
+    let viable_pools = filter_price_outliers(viable_pools);
+
     // Filter out non V3 concentrated pools if any V3 concentrated pool exists
     let has_v3_concentrated = viable_pools
         .iter()
@@ -126,6 +137,52 @@ pub fn select_best_pool(
     );
 
     Ok(best_pool.pool)
+}
+
+/// How far a pool's price may sit from the deepest pool's before it is
+/// treated as not a real market for the pair: a factor of 2 either way.
+const PRICE_SANITY_FACTOR: f64 = 2.0;
+
+/// Remove pools whose `current_price_a_in_b` is more than
+/// [`PRICE_SANITY_FACTOR`] away from that of the deepest pool. Pools without
+/// a price, or without a depth figure to pick a reference from, are kept —
+/// this guard only ever removes a pool it can positively call an outlier.
+fn filter_price_outliers(pools: Vec<(Pool, u128)>) -> Vec<(Pool, u128)> {
+    let depth = |pool: &Pool| -> u128 {
+        pool.tvl_asset_b
+            .map_or(pool.asset_b_reserve, |v| Some(u128::from(v)))
+            .unwrap_or(0)
+    };
+    let Some(reference_price) = pools
+        .iter()
+        .filter(|(pool, _)| {
+            pool.current_price_a_in_b
+                .is_some_and(|p| p.is_finite() && p > 0.0)
+        })
+        .max_by_key(|(pool, _)| depth(pool))
+        .filter(|(pool, _)| depth(pool) > 0)
+        .and_then(|(pool, _)| pool.current_price_a_in_b)
+    else {
+        return pools;
+    };
+    let (low, high) = (
+        reference_price / PRICE_SANITY_FACTOR,
+        reference_price * PRICE_SANITY_FACTOR,
+    );
+    pools
+        .into_iter()
+        .filter(|(pool, _)| match pool.current_price_a_in_b {
+            Some(price) if price < low || price > high => {
+                debug!(
+                    "Excluding pool {}: price {price} is outside [{low}, {high}] around the \
+                     deepest pool's {reference_price}",
+                    pool.lp_public_key
+                );
+                false
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 /// Calculates a weighted score for a pool based on fee efficiency, liquidity, and price stability.
@@ -791,5 +848,177 @@ mod tests {
             result_without.unwrap().lp_public_key,
             result_with.unwrap().lp_public_key
         );
+    }
+
+    // ── Poisoned-pool regression (mainnet BTC/USDB, 2026-09-07) ─────────
+    //
+    // Two empty V3 concentrated pools were created for the pair with ticks
+    // at ~1e30 and ~1e-30. Quoted from price alone, each cost "nothing" in
+    // one direction, won the fee-efficiency score against the real pool
+    // (1.6 BTC / $136k, $86M 24h volume), and every conversion then failed at
+    // the AMM with FSAG-4201. The figures below are the API's from that day.
+
+    const USDB: &str = "3206c93b24a4d18ea19d0a9a213204af2c7e74a6d16c7535cc5d33eca4ad1eca";
+
+    #[allow(clippy::too_many_arguments)]
+    fn v3_btc_usdb_pool(
+        pubkey: &str,
+        reserve_btc_sats: u128,
+        reserve_usdb: u128,
+        price_a_in_b: f64,
+        tvl: Option<u64>,
+        volume: Option<u64>,
+        price_change: Option<f64>,
+    ) -> Pool {
+        Pool {
+            lp_public_key: pubkey.parse().unwrap(),
+            host_name: "test".to_string(),
+            host_fee_bps: 0,
+            lp_fee_bps: 5,
+            asset_a_address: crate::BTC_ASSET_ADDRESS.to_string(),
+            asset_b_address: USDB.to_string(),
+            asset_a_reserve: Some(reserve_btc_sats),
+            asset_b_reserve: Some(reserve_usdb),
+            virtual_reserve_a: None,
+            virtual_reserve_b: None,
+            threshold_pct: None,
+            current_price_a_in_b: Some(price_a_in_b),
+            tvl_asset_b: tvl,
+            volume_24h_asset_b: volume,
+            price_change_percent_24h: price_change,
+            curve_type: Some(crate::amm::models::CurveType::V3Concentrated),
+            initial_reserve_a: None,
+            bonding_progress_percent: None,
+            graduation_threshold_amount: None,
+            created_at: "2026-02-08".to_string(),
+            updated_at: "2026-09-11".to_string(),
+        }
+    }
+
+    fn real_flashnet_pool() -> Pool {
+        v3_btc_usdb_pool(
+            "037579aee81891fc3a28cbe7b13e565031d46248b420fb39dcb308598f472b4513",
+            161_696_297,
+            136_228_013_439,
+            773.289_419_987_554_2,
+            Some(261_266_049_160),
+            Some(86_460_624_462_161),
+            Some(-1.10),
+        )
+    }
+
+    fn empty_pool_with_price(pubkey: &str, price_a_in_b: f64) -> Pool {
+        v3_btc_usdb_pool(pubkey, 0, 0, price_a_in_b, Some(0), Some(0), Some(0.0))
+    }
+
+    #[test]
+    fn empty_v3_pool_cannot_win_a_usdb_to_btc_swap() {
+        let pools = vec![
+            empty_pool_with_price(
+                "038e629c9de27f0b82ea9e649850ef46f3fa861fa9f7afb832ed386097305a8a5c",
+                1e30,
+            ),
+            empty_pool_with_price(
+                "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+                1e-30,
+            ),
+            real_flashnet_pool(),
+        ];
+        // 200,000 sats out, paid in USDB.
+        let best = select_best_pool(&pools, USDB, 200_000, 10, 0, Network::Mainnet).unwrap();
+        assert_eq!(best.lp_public_key, real_flashnet_pool().lp_public_key);
+    }
+
+    #[test]
+    fn empty_v3_pool_cannot_win_a_btc_to_usdb_swap() {
+        let pools = vec![
+            empty_pool_with_price(
+                "038e629c9de27f0b82ea9e649850ef46f3fa861fa9f7afb832ed386097305a8a5c",
+                1e30,
+            ),
+            empty_pool_with_price(
+                "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+                1e-30,
+            ),
+            real_flashnet_pool(),
+        ];
+        // 8.66 USDB out, paid in sats — the Stable Balance sweep that looped.
+        let best = select_best_pool(
+            &pools,
+            crate::BTC_ASSET_ADDRESS,
+            8_660_000,
+            10,
+            0,
+            Network::Mainnet,
+        )
+        .unwrap();
+        assert_eq!(best.lp_public_key, real_flashnet_pool().lp_public_key);
+    }
+
+    #[test]
+    fn empty_pool_is_the_only_candidate_then_nothing_is_selected() {
+        // Better to report no pool than to hand the AMM a swap it will refuse.
+        let pools = vec![empty_pool_with_price(
+            "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+            1e-30,
+        )];
+        assert!(select_best_pool(&pools, USDB, 200_000, 10, 0, Network::Mainnet).is_err());
+    }
+
+    #[test]
+    fn thinly_funded_pool_with_an_absurd_price_is_excluded_as_an_outlier() {
+        // The reserve check alone would let this one through for small
+        // amounts: it holds a little of each asset, but its price is a
+        // millionth of the market's, so it still quotes "free" and would win
+        // on fee efficiency.
+        let mut lure = v3_btc_usdb_pool(
+            "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+            500_000,
+            100_000_000,
+            773.0 / 1_000_000.0,
+            Some(100_000_000),
+            Some(0),
+            Some(0.0),
+        );
+        lure.host_name = "lure".to_string();
+        let pools = vec![lure, real_flashnet_pool()];
+        let best = select_best_pool(&pools, USDB, 200_000, 10, 0, Network::Mainnet).unwrap();
+        assert_eq!(best.lp_public_key, real_flashnet_pool().lp_public_key);
+    }
+
+    #[test]
+    fn price_outlier_filter_keeps_pools_near_the_deepest_pools_price() {
+        let near = v3_btc_usdb_pool(
+            "02894808873b896e21d29856a6d7bb346fb13c019739adb9bf0b6a8b7e28da53da",
+            245_114,
+            182_181_589,
+            743.25,
+            Some(364_363_030),
+            Some(0),
+            Some(0.0),
+        );
+        let far = empty_pool_with_price(
+            "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+            1e-30,
+        );
+        let kept =
+            filter_price_outliers(vec![(real_flashnet_pool(), 1), (near.clone(), 2), (far, 3)]);
+        let kept: Vec<_> = kept.into_iter().map(|(p, _)| p.lp_public_key).collect();
+        assert_eq!(
+            kept,
+            vec![real_flashnet_pool().lp_public_key, near.lp_public_key]
+        );
+
+        // No pool has depth → no reference → nothing is removed.
+        let mut a = real_flashnet_pool();
+        a.tvl_asset_b = None;
+        a.asset_b_reserve = None;
+        let mut b = empty_pool_with_price(
+            "0381f57ce8d84bf1d1e8023ea6048dba26e0975d526a4858286b561ca13e33f80a",
+            1e-30,
+        );
+        b.tvl_asset_b = None;
+        b.asset_b_reserve = None;
+        assert_eq!(filter_price_outliers(vec![(a, 1), (b, 2)]).len(), 2);
     }
 }
