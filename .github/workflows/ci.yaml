@@ -1,24 +1,33 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches:
+      - main
+      - redesign
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - edited
+      - converted_to_draft
   workflow_dispatch:
     inputs:
-        triggered_by:
-          description: Who triggered this run
-          required: false
-          default: manual
+      triggered_by:
+        description: Who triggered this run
+        required: false
+        default: manual
 
 run-name: ${{ inputs.triggered_by != '' && format('CI triggered by {0}', inputs.triggered_by) || github.event.head_commit.message || github.ref_name }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: batch-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'edited' && github.event.changes.base == null && github.run_id || 'candidate' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   clippy:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +47,7 @@ jobs:
         run: make cargo-clippy-check
 
   fmt:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Format
     runs-on: ubuntu-latest
     steps:
@@ -47,6 +57,7 @@ jobs:
         run: make fmt-check
 
   passkey-core-sync:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Passkey core sync
     runs-on: ubuntu-latest
     steps:
@@ -61,6 +72,7 @@ jobs:
         run: cargo xtask sync-passkey-core --check
 
   ios-cocoapods-compile:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: iOS CocoaPods compile
     runs-on: macos-latest
     steps:
@@ -80,6 +92,7 @@ jobs:
         run: ./scripts/check-ios-cocoapods.sh
 
   rn-post-ubrn-check:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: RN post-ubrn sync
     runs-on: ubuntu-latest
     steps:
@@ -95,6 +108,7 @@ jobs:
         run: node ./scripts/post-ubrn.js --check
 
   rn-expo-plugin:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: RN Expo plugin
     runs-on: ubuntu-latest
     defaults:
@@ -126,6 +140,7 @@ jobs:
           fi
 
   itest:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Integration test (${{ matrix.backend.name }})
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.backend.allow-failure }}
@@ -133,9 +148,9 @@ jobs:
       fail-fast: false
       matrix:
         backend:
-          - { name: in-memory, target: itest,             allow-failure: false }
-          - { name: postgres,  target: spark-itest-pg,    allow-failure: true }
-          - { name: mysql,     target: spark-itest-mysql, allow-failure: true }
+          - {name: in-memory, target: itest, allow-failure: false}
+          - {name: postgres, target: spark-itest-pg, allow-failure: true}
+          - {name: mysql, target: spark-itest-mysql, allow-failure: true}
     env:
       FAUCET_USERNAME: ${{ secrets.FAUCET_USERNAME }}
       FAUCET_PASSWORD: ${{ secrets.FAUCET_PASSWORD }}
@@ -151,6 +166,7 @@ jobs:
         run: make ${{ matrix.backend.target }}
 
   compat-itest:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Signer compatibility tests
     runs-on: ubuntu-latest
     steps:
@@ -165,6 +181,7 @@ jobs:
         run: make compat-itest
 
   test:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Test
     runs-on: ubuntu-latest
     steps:
@@ -182,6 +199,7 @@ jobs:
         uses: ./.github/actions/check-git-status
 
   breez-test:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Breez integration tests
     runs-on: ubuntu-latest
     env:
@@ -213,6 +231,7 @@ jobs:
             || echo "lnurl image was not built in this run"
 
   cli-itest:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Rust CLI binding tests
     runs-on: ubuntu-latest
     env:
@@ -241,6 +260,7 @@ jobs:
             || echo "lnurl image was not built in this run"
 
   wasm-itest:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: WASM binding tests
     runs-on: ubuntu-latest
     env:
@@ -276,6 +296,7 @@ jobs:
             || echo "lnurl image was not built in this run"
 
   wasm-clippy:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Wasm clippy
     runs-on: ubuntu-latest
     steps:
@@ -290,6 +311,7 @@ jobs:
         run: make wasm-clippy-check
 
   wasm-test:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Wasm test
     runs-on: ubuntu-latest
     steps:
@@ -307,6 +329,7 @@ jobs:
         uses: ./.github/actions/check-git-status
 
   flutter:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Flutter
     runs-on: ubuntu-latest
     steps:
@@ -360,11 +383,13 @@ jobs:
         run: make check-flutter
 
   cli:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: CLI
     uses: ./.github/workflows/cli-ci.yml
     secrets: inherit
 
   docs:
+    if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null))) }}
     name: Docs
     uses: ./.github/workflows/docs-ci.yml
     secrets: inherit
